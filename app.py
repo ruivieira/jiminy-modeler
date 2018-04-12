@@ -7,7 +7,6 @@ import os.path
 import sys
 import time
 
-import psycopg2
 import pyspark
 
 import logger
@@ -18,23 +17,6 @@ import storage
 def get_arg(env, default):
     """Extract command line args, else use defaults if none given."""
     return os.getenv(env) if os.getenv(env, '') is not '' else default
-
-
-def make_connection(host='127.0.0.1', port=5432, user='postgres',
-                    password='postgres', dbname='postgres'):
-    """Connect to a postgresql db."""
-    return psycopg2.connect(host=host, port=port, user=user,
-                            password=password, dbname=dbname)
-
-
-def build_connection(args):
-    """Make the db connection with an args object."""
-    conn = make_connection(host=args.host,
-                           port=args.port,
-                           user=args.user,
-                           password=args.password,
-                           dbname=args.dbname)
-    return conn
 
 
 def parse_args(parser):
@@ -64,15 +46,13 @@ def main(arguments):
 
     # set up SQL connection
     try:
-        con = build_connection(arguments)
+        data_loader = storage.PostgresDataLoader(arguments)
     except IOError:
         loggers.error("Could not connect to data store")
         sys.exit(1)
 
     # fetch the data from the db
-    cursor = con.cursor()
-    cursor.execute("SELECT * FROM ratings")
-    ratings = cursor.fetchall()
+    ratings = data_loader.fetchall()
     loggers.info("Fetched data from table")
     # create an RDD of the ratings data
     ratingsRDD = sc.parallelize(ratings)
@@ -118,24 +98,18 @@ def main(arguments):
 
         # check to see if new model should be created
         # select the maximum time stamp from the ratings database
-        cursor.execute(
-            "SELECT timestamp FROM ratings ORDER BY timestamp DESC LIMIT 1;"
-            )
-        checking_max_timestamp = cursor.fetchone()[0]
+        checking_max_timestamp = data_loader.latest_timestamp()
         loggers.info(
-            "The latest timestamp = {}". format(checking_max_timestamp))
+            "The latest timestamp = {}".format(checking_max_timestamp))
 
         if checking_max_timestamp > max_timestamp:
             # build a new model
             # first, fetch all new ratings
-            cursor.execute(
-                "SELECT * FROM ratings WHERE (timestamp > %s);",
-                (max_timestamp,))
-            new_ratings = cursor.fetchall()
+            new_ratings = data_loader.fetchafter(max_timestamp)
             max_timestamp = checking_max_timestamp
             new_ratingsRDD = sc.parallelize(new_ratings)
             new_ratingsRDD = new_ratingsRDD.map(lambda x: (x[1], x[2], x[3]))
-            ratings = ratingsRDD.union(new_ratingsRDD)
+            ratingsRDD = ratingsRDD.union(new_ratingsRDD)
             model_version += 1
             loggers.info("Training model, version={}".format(model_version))
             # train the model
@@ -160,28 +134,28 @@ if __name__ == '__main__':
     parser.add_argument(
         '--host', default='127.0.0.1',
         help='the postgresql host address (default:127.0.0.1).'
-        'env variable: DB_HOST')
+             'env variable: DB_HOST')
     parser.add_argument(
         '--dbname', default='postgres',
         help='the database name to load with data. env variable: DB_DBNAME')
     parser.add_argument(
         '--port', default=5432, help='the postgresql port (default: 5432). '
-        'env variable: DB_PORT')
+                                     'env variable: DB_PORT')
     parser.add_argument(
         '--user', default='postgres',
         help='the user for the postgresql database (default: postgres). '
-        'env variable: DB_USER')
+             'env variable: DB_USER')
     parser.add_argument(
         '--password', default='postgres',
         help='the password for the postgresql user (default: postgres). '
-        'env variable: DB_PASSWORD')
+             'env variable: DB_PASSWORD')
     parser.add_argument(
         '--mongo-uri', default='mongodb://localhost:27017', dest='mongoURI',
         help='the mongodb URI (default:mongodb://localhost:27017).'
-        'env variable:MONGO_URI')
+             'env variable:MONGO_URI')
     parser.add_argument(
         '--disable-fast-train', dest='slowtrain', action='store_true',
         help='disable the faster training method, warning this may slow '
-        'down quite a bit for the first run.')
+             'down quite a bit for the first run.')
     args = parse_args(parser)
     main(arguments=args)
