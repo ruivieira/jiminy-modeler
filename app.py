@@ -7,7 +7,6 @@ import os.path
 import sys
 import time
 
-import psycopg2
 import pyspark
 
 import logger
@@ -20,23 +19,6 @@ def get_arg(env, default):
     return os.getenv(env) if os.getenv(env, '') is not '' else default
 
 
-def make_connection(host='127.0.0.1', port=5432, user='postgres',
-                    password='postgres', dbname='postgres'):
-    """Connect to a postgresql db."""
-    return psycopg2.connect(host=host, port=port, user=user,
-                            password=password, dbname=dbname)
-
-
-def build_connection(args):
-    """Make the db connection with an args object."""
-    conn = make_connection(host=args.host,
-                           port=args.port,
-                           user=args.user,
-                           password=args.password,
-                           dbname=args.dbname)
-    return conn
-
-
 def parse_args(parser):
     """Parsing command line args."""
     args = parser.parse_args()
@@ -46,39 +28,7 @@ def parse_args(parser):
     args.password = get_arg('DB_PASSWORD', args.password)
     args.dbname = get_arg('DB_DBNAME', args.dbname)
     args.mongoURI = get_arg('MONGO_URI', args.mongoURI)
-    args.rankval = check_positive_integer(get_arg('RANK_VAL', args.rankval))
-    args.itsval = check_iterations_value(get_arg('ITS_VAL', args.itsval))
-    args.lambdaval = check_lambda_value(get_arg('LAMBDA_VAL', args.lambdaval))
     return args
-
-
-def check_positive_integer(string):
-    """Checking that values are poitive integers."""
-    fval = float(string)
-    ival = int(fval)
-    if ival != fval or ival <= 0:
-        msg = "%r is not a positive integer" % string
-        raise argparse.ArgumentTypeError(msg)
-    return ival
-
-
-def check_iterations_value(string):
-    """Checking that the value is a positive integer. Warn if too large."""
-    pval = check_positive_integer(string)
-    if pval > 10:
-        logger.get_logger().warning("Large iterations causes slow model build")
-    return pval
-
-
-def check_lambda_value(string):
-    """Check that lambda is positive. Warn if too large."""
-    fval = float(string)
-    if fval <= 0:
-        msg = "%r is not positive" % string
-        raise argparse.ArgumentTypeError(msg)
-    if fval > 1:
-        logger.get_logger().warning("Optimal lambda is commonly in (0,1)")
-    return fval
 
 
 def main(arguments):
@@ -96,15 +46,13 @@ def main(arguments):
 
     # set up SQL connection
     try:
-        con = build_connection(arguments)
+        data_loader = storage.PostgresDataLoader(arguments)
     except IOError:
         loggers.error("Could not connect to data store")
         sys.exit(1)
 
     # fetch the data from the db
-    cursor = con.cursor()
-    cursor.execute("SELECT * FROM ratings")
-    ratings = cursor.fetchall()
+    ratings = data_loader.fetchall()
     loggers.info("Fetched data from table")
     # create an RDD of the ratings data
     ratingsRDD = sc.parallelize(ratings)
@@ -116,8 +64,6 @@ def main(arguments):
     estimator = modeller.Estimator(ratingsRDD)
 
     if get_arg('DISABLE_FAST_TRAIN', args.slowtrain) is True:
-        loggers.warn("Any ALS parameters given on the command line will not"
-                     " be used in when fast train is disabled.")
         # basic parameter selection
         loggers.info('Using slow training method')
         parameters = estimator.run(ranks=[2, 4, 6, 8],
@@ -126,9 +72,7 @@ def main(arguments):
     else:
         # override basic parameters for faster testing
         loggers.info('Using fast training method')
-        parameters = {'rank': arguments.rankval,
-                      'lambda': arguments.lambdaval,
-                      'iteration': arguments.itsval}
+        parameters = {'rank': 6, 'lambda': 0.09, 'iteration': 2}
 
     # train the model
     model = modeller.Trainer(data=ratingsRDD,
@@ -154,20 +98,14 @@ def main(arguments):
 
         # check to see if new model should be created
         # select the maximum time stamp from the ratings database
-        cursor.execute(
-            "SELECT timestamp FROM ratings ORDER BY timestamp DESC LIMIT 1;"
-            )
-        checking_max_timestamp = cursor.fetchone()[0]
+        checking_max_timestamp = data_loader.latest_timestamp()
         loggers.info(
-            "The latest timestamp = {}". format(checking_max_timestamp))
+            "The latest timestamp = {}".format(checking_max_timestamp))
 
         if checking_max_timestamp > max_timestamp:
             # build a new model
             # first, fetch all new ratings
-            cursor.execute(
-                "SELECT * FROM ratings WHERE (timestamp > %s);",
-                (max_timestamp,))
-            new_ratings = cursor.fetchall()
+            new_ratings = data_loader.fetchafter(max_timestamp)
             max_timestamp = checking_max_timestamp
             new_ratingsRDD = sc.parallelize(new_ratings)
             new_ratingsRDD = new_ratingsRDD.map(lambda x: (x[1], x[2], x[3]))
@@ -196,37 +134,28 @@ if __name__ == '__main__':
     parser.add_argument(
         '--host', default='127.0.0.1',
         help='the postgresql host address (default:127.0.0.1).'
-        'env variable: DB_HOST')
+             'env variable: DB_HOST')
     parser.add_argument(
         '--dbname', default='postgres',
         help='the database name to load with data. env variable: DB_DBNAME')
     parser.add_argument(
         '--port', default=5432, help='the postgresql port (default: 5432). '
-        'env variable: DB_PORT')
+                                     'env variable: DB_PORT')
     parser.add_argument(
         '--user', default='postgres',
         help='the user for the postgresql database (default: postgres). '
-        'env variable: DB_USER')
+             'env variable: DB_USER')
     parser.add_argument(
         '--password', default='postgres',
         help='the password for the postgresql user (default: postgres). '
-        'env variable: DB_PASSWORD')
+             'env variable: DB_PASSWORD')
     parser.add_argument(
         '--mongo-uri', default='mongodb://localhost:27017', dest='mongoURI',
         help='the mongodb URI (default:mongodb://localhost:27017).'
-        'env variable:MONGO_URI')
+             'env variable:MONGO_URI')
     parser.add_argument(
         '--disable-fast-train', dest='slowtrain', action='store_true',
         help='disable the faster training method, warning this may slow '
-        'down quite a bit for the first run.')
-    parser.add_argument(
-        '--rankval', default=6, type=check_positive_integer, help='fixing '
-        'the rank parameter of ALS. (default = 6). env variable:RANK_VAL')
-    parser.add_argument(
-        '--itsval', default=2, type=check_iterations_value, help='fix ALS '
-        'iterations parameter (default = 2). env variable:ITS_VAL')
-    parser.add_argument(
-        '--lambdaval', default=0.01, type=check_lambda_value, help='fix ALS '
-        'lambda parameter (default: 0.01). env variable:LAMBDA_VAL')
+             'down quite a bit for the first run.')
     args = parse_args(parser)
     main(arguments=args)
